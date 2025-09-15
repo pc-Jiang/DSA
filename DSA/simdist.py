@@ -379,16 +379,15 @@ class SimilarityTransformDist:
                     score_tensor
                 )
             else:
-                score = score_tensor.detach().cpu().numpy()
-                if np.isnan(score):
-                    score = np.pi if (num / den).item() < 0 else 0.0
-        else:
+                cos_val = torch.clamp(cos_val, -1.0, 1.0)
+                score = torch.arccos(cos_val).cpu().numpy()
+        else: # "euclidean"
             diff = A - C @ B @ Cinv
             norm_tensor = torch.norm(diff, dim=(-2, -1))  # per batch
             if norm_tensor.requires_grad:
                 score = norm_tensor
             else:
-                score = norm_tensor.detach().cpu().numpy().item()
+                score = norm_tensor.detach().cpu().numpy()
 
     
         return score
@@ -446,7 +445,7 @@ class SimilarityTransformDist:
             elif self.verbose: #otherwise resort to L2 Wasserstein over singular or eigenvalues
                 print(f"resorting to wasserstein distance over {self.wasserstein_compare}")
 
-        if self.score_method == "wasserstein":
+        if score_method == "wasserstein":
             # assert self.wasserstein_compare in {"sv","eig"}
             if batch is None:
                 # if self.wasserstein_compare == "sv":
