@@ -472,8 +472,10 @@ class SimilarityTransformDist:
                 from joblib import Parallel, delayed
                 if A.shape[0] != B.shape[0]:
                     raise AssertionError("When using batching, A and B must have the same batch size")
-                scores = Parallel(n_jobs=n_job, verbose=1)(
-                delayed(wasserstein_pair)(A[i], B[i], self.wasserstein_compare) for i in range(len(A))
+                A = A.cpu()
+                B = B.cpu()
+                scores = Parallel(n_jobs=n_job, prefer="threads", verbose=1)( # cuda OOM
+                delayed(wasserstein_pair)(A[i], B[i], self.wasserstein_compare) for i in range(batch)
             )
             score_star = np.array(scores)
 
