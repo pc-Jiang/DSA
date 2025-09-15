@@ -30,7 +30,7 @@ def embed_signal_torch(data, n_delays, delay_interval=1):
         data = torch.from_numpy(data)
     device = data.device
 
-    if data.shape[int(data.ndim == 3)] - (n_delays - 1) * delay_interval < 1:
+    if data.shape[int(data.ndim == 3)] - (n_delays - 1) * delay_interval < 1: # TODO n_delays is a list here
         raise ValueError(
             "The number of delays is too large for the number of time points in the data!"
         )

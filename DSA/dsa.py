@@ -239,7 +239,7 @@ class DSA:
                  device='cpu',
                  verbose=False,
                  send_to_cpu=True
-                ):
+                ): # error raised in dmd.embed_signal_torch when directly calling this
         """
         Recomputes only the DMDs with a single set of hyperparameters. This will not compare, that will need to be done with the full procedure
         """
@@ -270,7 +270,7 @@ class DSA:
 
         return dmds
 
-    def fit_score(self, parallel=False, n_job=12):
+    def fit_score(self, parallel=False, n_job=-1):
         """
         Standard fitting function for both DMDs and PoVF
         
@@ -289,7 +289,7 @@ class DSA:
 
         return self.score(parallel=parallel, n_job=n_job)
     
-    def score(self,iters=None,lr=None,score_method=None, parallel=False, n_job=12):
+    def score(self,iters=None,lr=None,score_method=None, parallel=False, n_job=-1):
         """
         Rescore DSA with precomputed dmds if you want to try again
 
@@ -337,45 +337,63 @@ class DSA:
                 return self.sims[0,0]
         
         else:
-            from joblib import Parallel, delayed
-            len_dmds0 = len(self.dmds[0])
-            len_dmds_ind2 = len(self.dmds[ind2])
+            # from joblib import Parallel, delayed
+            # len_dmds0 = len(self.dmds[0])
+            # len_dmds_ind2 = len(self.dmds[ind2])
             
-            # Precompute A_v arrays to reduce overhead
-            dmds0_Av = [dmd.A_v for dmd in self.dmds[0]]
-            dmds_ind2_Av = [dmd.A_v for dmd in self.dmds[ind2]]
+            # # Precompute A_v arrays to reduce overhead
+            # dmds0_Av = [dmd.A_v for dmd in self.dmds[0]]
+            # dmds_ind2_Av = [dmd.A_v for dmd in self.dmds[ind2]]
 
-            # Generate all (i,j) pairs to process
-            pairs = []
-            if self.method == 'self-pairwise':
-                pairs = [(i, j) for i in range(len_dmds0) for j in range(i)]
-            else:
-                pairs = [(i, j) for i in range(len_dmds0) for j in range(len_dmds_ind2)]
+            # # Generate all (i,j) pairs to process
+            # pairs = []
+            # if self.method == 'self-pairwise':
+            #     pairs = [(i, j) for i in range(len_dmds0) for j in range(i)]
+            # else:
+            #     pairs = [(i, j) for i in range(len_dmds0) for j in range(len_dmds_ind2)]
 
-            # Prepare tasks with necessary data
-            tasks = [
-                (
-                    dmds0_Av[i],
-                    dmds_ind2_Av[j],
-                    iters,
-                    lr,
-                    score_method,
-                    self.zero_pad,
-                    self.simdist
-                )
-                for i, j in pairs
-            ]
+            # # Prepare tasks with necessary data
+            # tasks = [
+            #     (
+            #         dmds0_Av[i],
+            #         dmds_ind2_Av[j],
+            #         iters,
+            #         lr,
+            #         score_method,
+            #         self.zero_pad,
+            #         self.simdist
+            #     )
+            #     for i, j in pairs
+            # ]
 
-            # Parallel computation # TODO CUDA error: out of memory
-            results = Parallel(n_jobs=n_job, verbose=self.verbose)(
-                delayed(compute_sim)(*task) for task in tasks
+            # # Parallel computation # TODO CUDA error: out of memory
+            # results = Parallel(n_jobs=n_job, verbose=self.verbose)(
+            #     delayed(compute_sim)(*task) for task in tasks
+            # )
+
+            # # Populate similarity matrix
+            # for idx, (i, j) in enumerate(pairs):
+            #     self.sims[i, j] = results[idx]
+            #     if self.method == 'self-pairwise':
+            #         self.sims[j, i] = results[idx]
+            dmds1 = self.dmds[0]
+            dmds2 = self.dmds[ind2]
+
+            self.sims = compute_similarity_matrix(
+                dmds1,
+                dmds2,
+                self.simdist,
+                iters,
+                lr,
+                score_method,
+                self.zero_pad,
+                self.device,
+                symmetric=(self.method == 'self-pairwise'),
+                n_job=n_job
             )
 
-            # Populate similarity matrix
-            for idx, (i, j) in enumerate(pairs):
-                self.sims[i, j] = results[idx]
-                if self.method == 'self-pairwise':
-                    self.sims[j, i] = results[idx]
+            if self.method == 'default':
+                return self.sims[0,0]
 
         return self.sims
     
@@ -383,3 +401,70 @@ class DSA:
 def compute_sim(a1, a2, iters, lr, score_method, zero_pad, simdist):
     """Helper function to compute similarity for a single pair"""
     return simdist.fit_score(a1, a2, iters, lr, score_method, zero_pad=zero_pad)
+
+
+def to_float_tensor(arr):
+    if isinstance(arr, torch.Tensor):
+        return arr.float()
+    elif isinstance(arr, np.ndarray):
+        return torch.from_numpy(arr).float()
+    else:
+        raise ValueError("Input must be a numpy array or a torch tensor")
+
+
+def compute_similarity_matrix(dmds1, dmds2, simdist, iters, lr, score_method, zero_pad, device=None, symmetric=False, n_job=-1):
+    """
+    Vectorized pairwise similarity computation on GPU.
+    dmds: list of objects, each with .A_v (2D array)
+    simdist: your similarity distance object
+    """
+    device = 'cpu' if device is None else device
+
+    # Stack all A_v into one tensor
+    Avs1 = [to_float_tensor(dmd.A_v) for dmd in dmds1]
+    Avs2 = [to_float_tensor(dmd.A_v) for dmd in dmds2]
+
+    M1 = len(Avs1)
+    M2 = len(Avs2)
+    sims = np.zeros((M1, M2))
+
+    # Create all pairs of matrices
+    A_list = []
+    B_list = []
+    indices = []
+
+    if symmetric:
+        for i in range(M1):
+            for j in range(i, M1):
+                A_list.append(Avs1[i])
+                B_list.append(Avs1[j])
+                indices.append((i, j))
+    else:
+        for i in range(M1):
+            for j in range(M2):
+                A_list.append(Avs1[i])
+                B_list.append(Avs2[j])
+                indices.append((i, j))
+
+    if not A_list:
+        return sims.cpu().numpy()
+
+    # Pad and stack matrices
+    max_dim = max(max(a.shape[0] for a in A_list), max(b.shape[0] for b in B_list))
+    
+    A_padded = torch.stack([torch.nn.functional.pad(a, (0, max_dim - a.shape[1], 0, max_dim - a.shape[0])) for a in A_list])
+    B_padded = torch.stack([torch.nn.functional.pad(b, (0, max_dim - b.shape[1], 0, max_dim - b.shape[0])) for b in B_list])
+
+    A_padded = A_padded.to(device)
+    B_padded = B_padded.to(device)
+
+    # Compute scores in a batch
+    scores = simdist.fit_score(A_padded, B_padded, iters, lr, score_method, zero_pad=zero_pad,batch=A_padded.shape[0], n_job=n_job)
+
+    # Place scores in the similarity matrix
+    for idx, (i, j) in enumerate(indices):
+        sims[i, j] = scores[idx]
+        if symmetric:
+            sims[j, i] = scores[idx]
+
+    return sims

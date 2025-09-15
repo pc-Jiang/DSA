@@ -25,7 +25,7 @@ class LearnableSimilarityTransform(nn.Module):
     """
     Computes the similarity transform for a learnable orthonormal matrix C 
     """
-    def __init__(self, n,orthog=True):
+    def __init__(self, n,orthog=True, batch_size=None, device="cpu"):
         """
         Parameters
         __________
@@ -34,14 +34,25 @@ class LearnableSimilarityTransform(nn.Module):
         """
         super(LearnableSimilarityTransform, self).__init__()
         #initialize orthogonal matrix as identity
-        self.C = nn.Parameter(torch.eye(n).float())
+        # self.C = nn.Parameter(torch.eye(n).float())
         self.orthog = orthog
+        if batch_size is None:
+            # Single learnable C (n, n)
+            C_init = torch.eye(n, device=device).float()
+        else:
+            # Batch of learnable Cs (batch, n, n)
+            C_init = torch.eye(n, device=device).float().expand(batch_size, n, n).clone()
+
+        # Register C as a parameter (this is what parametrizations will wrap)
+        self.C = nn.Parameter(C_init)
+
         
     def forward(self, B):
         if self.orthog:
             return self.C @ B @ self.C.transpose(-1, -2)
         else:
-            return self.C @ B @ torch.linalg.inv(self.C)
+            C_inv = torch.linalg.inv(self.C)  # works with batched C too
+            return self.C @ B @ C_inv
 
 class Skew(nn.Module):
     def __init__(self,n,device):
@@ -99,7 +110,16 @@ class CayleyMap(nn.Module):
 
     def forward(self, X):
         # (I + X)(I - X)^{-1}
-        return torch.linalg.solve(self.Id + X, self.Id - X)
+        if X.dim() == 2:
+            # Single matrix
+            return torch.linalg.solve(self.Id + X, self.Id - X)
+        elif X.dim() == 3:
+            # Batch of matrices: need to expand Id
+            batch_size, n, _ = X.shape
+            Id_batch = self.Id.expand(batch_size, n, n)
+            return torch.linalg.solve(Id_batch + X, Id_batch - X)
+        else:
+            raise ValueError("X must be 2D or 3D tensor")
     
 class SimilarityTransformDist:
     """
@@ -158,6 +178,7 @@ class SimilarityTransformDist:
             iters = None, 
             lr = None, 
             group = None,
+            batch = None
             ):
         """
         Computes the optimal matrix C over specified group
@@ -179,9 +200,16 @@ class SimilarityTransformDist:
         _______
         None
         """
-        assert A.shape[0] == A.shape[1]
-        assert B.shape[0] == B.shape[1]
-    
+        if len(A.shape)==2:
+            assert A.shape[0] == A.shape[1]
+        elif len(A.shape)==3:
+            assert A.shape[1] == A.shape[2]
+
+        if len(B.shape)==2:
+            assert B.shape[0] == B.shape[1]
+        elif len(B.shape)==3:
+            assert B.shape[1] == B.shape[2]
+
         A = A.to(self.device)
         B = B.to(self.device)
         self.A,self.B = A,B
@@ -194,32 +222,46 @@ class SimilarityTransformDist:
                                                                      B,
                                                                      lr,iters,
                                                                      orthog=True,
-                                                                     verbose=self.verbose)
+                                                                     verbose=self.verbose,
+                                                                     batch = batch)
         if group == "O(n)":
             #permute the first row and column of B then rerun the optimization
-            P = torch.eye(B.shape[0],device=self.device)
+            if B.ndim == 2:  # single matrix
+                n = B.shape[0]
+            elif B.ndim == 3:  # batched matrices
+                n = B.shape[1]
+            P = torch.eye(n,device=self.device)
             if P.shape[0] > 1:
                 P[[0, 1], :] = P[[1, 0], :]
+            if B.ndim == 2:
+                B_perm = P @ B @ P.T
+            else:  # batched
+                B_perm = P @ B @ P.T
             losses, C_star, sim_net = self.optimize_C(A,
-                                                    P @ B @ P.T,
+                                                    B_perm,
                                                     lr,iters,
                                                     orthog=True,
-                                                    verbose=self.verbose)
-            if losses[-1] < self.losses[-1]:
+                                                    verbose=self.verbose,
+                                                    batch=batch)
+            if losses[-1] < self.losses[-1]: # losses[-1]=1042.808 Is this too large? ()
                 self.losses = losses
-                self.C_star = C_star @ P
+                if C_star.ndim == 2:
+                    self.C_star = C_star @ P
+                else:  # batched case
+                    self.C_star = C_star @ P
                 self.sim_net = sim_net
         if group == "GL(n)":
             self.losses, self.C_star, self.sim_net = self.optimize_C(A,
                                                                 B,
                                                                 lr,iters,
                                                                 orthog=False,
-                                                                verbose=self.verbose)
+                                                                verbose=self.verbose,
+                                                                batch=batch)
 
-    def optimize_C(self,A,B,lr,iters,orthog,verbose):
+    def optimize_C(self,A,B,lr,iters,orthog,verbose,batch=None): # TODO this is the bottleneck
         #parameterize mapping to be orthogonal
-        n = A.shape[0]
-        sim_net = LearnableSimilarityTransform(n,orthog=orthog).to(self.device)
+        n = A.shape[-1]
+        sim_net = LearnableSimilarityTransform(n,orthog=orthog,batch_size=batch).to(self.device)
         if orthog:
             parametrize.register_parametrization(sim_net, "C", Skew(n,self.device))
             parametrize.register_parametrization(sim_net, "C", CayleyMap(n,self.device))
@@ -232,8 +274,8 @@ class SimilarityTransformDist:
         # scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
 
         losses = []
-        A = A / torch.linalg.norm(A)
-        B = B / torch.linalg.norm(B)
+        A = A / A.norm(dim=(-2,-1), keepdim=True)
+        B = B / B.norm(dim=(-2,-1), keepdim=True)
         for _ in range(iters):
             # Zero the gradients of the optimizer.
             optimizer.zero_grad()      
@@ -253,7 +295,7 @@ class SimilarityTransformDist:
         C_star = sim_net.C.detach()
         return losses, C_star,sim_net
     
-    def score(self,A=None,B=None,score_method=None,group=None):
+    def score(self,A=None,B=None,score_method=None,group=None,batch=None):
         """
         Given an optimal C already computed, calculate the metric
 
@@ -286,18 +328,47 @@ class SimilarityTransformDist:
             if not isinstance(B,torch.Tensor):
                 B = torch.from_numpy(B).float().to(self.device)
             C = self.C_star.to(self.device)
+        
+        # Support both single and batched
+        if A.ndim == 2:
+            A = A.unsqueeze(0)  # [1, n, n]
+        if B.ndim == 2:
+            B = B.unsqueeze(0)
+        if C.ndim == 2:
+            C = C.unsqueeze(0)
+
+        assert A.shape == B.shape == C.shape
 
         if group in {"SO(n)", "O(n)"}:
-            Cinv = C.T
+            Cinv = C.transpose(-1, -2)
         elif group in {"GL(n)"}:
             Cinv = torch.linalg.inv(C)
         else:
             raise AssertionError("Need proper group name")
-        if score_method == 'angular':   
-            num = torch.trace(A.T @ C @ B @ Cinv) 
-            den = torch.norm(A,p = 'fro')*torch.norm(B,p = 'fro')
+        # if score_method == 'angular':    
+        #     num = torch.trace(A.T @ C @ B @ Cinv) 
+        #     den = torch.norm(A,p = 'fro')*torch.norm(B,p = 'fro')
+        #     score = torch.arccos(num/den).cpu().numpy()
+        #     if np.isnan(score): #around -1 and 1, we sometimes get NaNs due to arccos
+        #         if num/den < 0:
+        #             score = np.pi
+        #         else:
+        #             score = 0
+        # else:
+        #     score = torch.norm(A - C @ B @ Cinv,p='fro').cpu().numpy().item() #/ A.numpy().size
+    
+        # return score
+        # pass
+        if score_method == "angular":
+            # numerator = tr(A^T C B C^-1)
+            X = A.transpose(-1, -2) @ C @ B @ Cinv   # [batch, n, n]
+            num = X.diagonal(dim1=-2, dim2=-1).sum(-1)  # [batch]
+            den = torch.norm(A, p='fro', dim=(-2, -1)) * torch.norm(B, p='fro', dim=(-2, -1))
+            cos_val = num / den
+            # Clamp for numerical safety
+            # cos_val = torch.clamp(cos_val, -1.0, 1.0)
+            # score = torch.arccos(cos_val).cpu().numpy()
             score_tensor = torch.arccos(num / den)
- 
             if score_tensor.requires_grad:
                 pi_tensor = torch.tensor(np.pi, device=score_tensor.device, dtype=score_tensor.dtype)
                 zero_tensor = torch.tensor(0.0, device=score_tensor.device, dtype=score_tensor.dtype)
@@ -312,7 +383,8 @@ class SimilarityTransformDist:
                 if np.isnan(score):
                     score = np.pi if (num / den).item() < 0 else 0.0
         else:
-            norm_tensor = torch.norm(A - C @ B @ Cinv, p='fro')
+            diff = A - C @ B @ Cinv
+            norm_tensor = torch.norm(diff, dim=(-2, -1))  # per batch
             if norm_tensor.requires_grad:
                 score = norm_tensor
             else:
@@ -327,7 +399,11 @@ class SimilarityTransformDist:
                 iters = None, 
                 lr = None,
                 score_method = None,
-                group = None):
+                zero_pad = True,
+                group = None,
+                batch=None,
+                n_job=-1
+                ):
         """
         for efficiency, computes the optimal matrix and returns the score 
 
@@ -360,8 +436,11 @@ class SimilarityTransformDist:
         if isinstance(B,np.ndarray):
             B = torch.from_numpy(B).float()
 
-        assert A.shape[0] == B.shape[1] or self.wasserstein_compare is not None
-        if A.shape[0] != B.shape[0]:
+        offset = 0
+        if len(A.shape)==3 and len(B.shape)==3:
+            offset = 1
+        assert A.shape[0+offset] == B.shape[1+offset] or self.wasserstein_compare is not None
+        if A.shape[0+offset] != B.shape[0+offset]:
             if self.wasserstein_compare is None:
                 raise AssertionError("Matrices must be the same size unless using wasserstein distance")
             elif self.verbose: #otherwise resort to L2 Wasserstein over singular or eigenvalues
@@ -369,31 +448,62 @@ class SimilarityTransformDist:
 
         if self.score_method == "wasserstein":
             # assert self.wasserstein_compare in {"sv","eig"}
-            # if self.wasserstein_compare == "sv":
-            #     a = torch.svd(A).S.view(-1,1)
-            #     b = torch.svd(B).S.view(-1,1)
-            # if self.wasserstein_compare == "eig":
-            a = torch.linalg.eig(A).eigenvalues
-            a = torch.vstack([a.real,a.imag]).T
+            if batch is None:
+                # if self.wasserstein_compare == "sv":
+                #     a = torch.svd(A).S.view(-1,1)
+                #     b = torch.svd(B).S.view(-1,1)
+                # elif self.wasserstein_compare == "eig":
+                a = torch.linalg.eig(A).eigenvalues
+                a = torch.vstack([a.real,a.imag]).T
 
-            b = torch.linalg.eig(B).eigenvalues
-            b = torch.vstack([b.real,b.imag]).T
-            # else:
-            #     raise AssertionError("wasserstein_compare must be or 'eig'")
-            device = a.device
-            a = a#.cpu()
-            b = b#.cpu()
-            M = ot.dist(a,b)#.numpy()
-            a,b = torch.ones(a.shape[0])/a.shape[0],torch.ones(b.shape[0])/b.shape[0]
-            a,b = a.to(device),b.to(device)
+                b = torch.linalg.eig(B).eigenvalues
+                b = torch.vstack([b.real,b.imag]).T
+                # else:
+                #     raise AssertionError("wasserstein_compare must be 'sv' or 'eig'")
+                device = a.device
+                a = a#.cpu()
+                b = b#.cpu()
+                M = ot.dist(a,b)#.numpy()
+                a,b = torch.ones(a.shape[0])/a.shape[0],torch.ones(b.shape[0])/b.shape[0]
+                a,b = a.to(device),b.to(device)
 
-            score_star = ot.emd2(a,b,M) 
-            #wasserstein_distance(A.cpu().numpy(),B.cpu().numpy())
+                score_star = ot.emd2(a,b,M) 
+                #wasserstein_distance(A.cpu().numpy(),B.cpu().numpy())
+            else:
+                from joblib import Parallel, delayed
+                if A.shape[0] != B.shape[0]:
+                    raise AssertionError("When using batching, A and B must have the same batch size")
+                scores = Parallel(n_jobs=n_job, verbose=1)(
+                delayed(wasserstein_pair)(A[i], B[i], self.wasserstein_compare) for i in range(len(A))
+            )
+            score_star = np.array(scores)
 
         else:
        
-            self.fit(A, B,iters,lr,group)
-            score_star = self.score(self.A,self.B,score_method=score_method,group=group)
+            self.fit(A, B,iters,lr,group,batch=batch)
+            score_star = self.score(self.A,self.B,score_method=score_method,group=group, batch=batch)
 
-        return score_star
+        return score_star    
+    
 
+def wasserstein_pair(A, B, wasserstein_compare="eig"):
+    # if wasserstein_compare == "sv":
+    #     a = torch.svd(A).S.view(-1,1)
+    #     b = torch.svd(B).S.view(-1,1)
+    # elif wasserstein_compare == "eig":
+    a = torch.linalg.eig(A).eigenvalues
+    a = torch.vstack([a.real,a.imag]).T
+
+    b = torch.linalg.eig(B).eigenvalues
+    b = torch.vstack([b.real,b.imag]).T
+    # else:
+    #     raise AssertionError("wasserstein_compare must be 'sv' or 'eig'")
+    device = 'cpu'
+    a = a.cpu()
+    b = b.cpu()
+    M = ot.dist(a,b)#.numpy()
+    a,b = torch.ones(a.shape[0])/a.shape[0],torch.ones(b.shape[0])/b.shape[0]
+    a,b = a.to(device),b.to(device)
+
+    score_star = ot.emd2(a,b,M) 
+    return score_star
