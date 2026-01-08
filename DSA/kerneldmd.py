@@ -1,5 +1,5 @@
 from sklearn.gaussian_process.kernels import DotProduct, RBF
-from kooplearn.data import traj_to_contexts
+# from kooplearn.data import traj_to_contexts
 from kooplearn.models import  NystroemKernel
 import numpy as np
 import torch

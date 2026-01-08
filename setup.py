@@ -16,6 +16,7 @@ setuptools.setup(
         'kooplearn>=1.1.0',
         'pot',
         'omegaconf',
+        'kooplearn',
     ],
     extras_require={
         'dev': [

@@ -6,6 +6,9 @@ import torch
 import numpy as np
 from omegaconf.listconfig import ListConfig
 
+import math
+import gc
+
 class DSA:
     """
     Computes the Dynamical Similarity Analysis (DSA) for two data matrices
@@ -264,7 +267,7 @@ class DSA:
                      rank,rank_thresh,rank_explained_variance,reduced_rank_reg,
                      lamb,device,verbose,send_to_cpu) for Xi in dat] for dat in data]
             
-        for dmd_sets in dmds:
+        for dmd_sets in dmds: # TODO this may also be parallelized
             for dmd in dmd_sets:
                 dmd.fit()
 
@@ -412,7 +415,7 @@ def to_float_tensor(arr):
         raise ValueError("Input must be a numpy array or a torch tensor")
 
 
-def compute_similarity_matrix(dmds1, dmds2, simdist, iters, lr, score_method, zero_pad, device=None, symmetric=False, n_job=-1):
+def compute_similarity_matrix(dmds1, dmds2, simdist, iters, lr, score_method, zero_pad, device=None, symmetric=False, n_job=-1, max_retries=5):
     """
     Vectorized pairwise similarity computation on GPU.
     dmds: list of objects, each with .A_v (2D array)
@@ -455,13 +458,61 @@ def compute_similarity_matrix(dmds1, dmds2, simdist, iters, lr, score_method, ze
     A_padded = torch.stack([torch.nn.functional.pad(a, (0, max_dim - a.shape[1], 0, max_dim - a.shape[0])) for a in A_list])
     B_padded = torch.stack([torch.nn.functional.pad(b, (0, max_dim - b.shape[1], 0, max_dim - b.shape[0])) for b in B_list])
 
-    A_padded = A_padded.to(device)
-    B_padded = B_padded.to(device)
+    # A_padded = A_padded.to(device)
+    # B_padded = B_padded.to(device)
+
+    total_pairs = len(A_padded)
+
+    # --- Auto-tune n_blocks ---
+    n_blocks = 2
+    success = False
+    tried = 0
+    while not success and tried < max_retries:
+        try:
+            block_size = math.ceil(total_pairs / n_blocks)
+            print(f"Trying with n_blocks={n_blocks}, block_size={block_size}")
+
+            scores = []
+            for start in range(0, total_pairs, block_size):
+                end = min(start + block_size, total_pairs)
+                A_block = A_padded[start:end].to(device)
+                B_block = B_padded[start:end].to(device)
+
+                block_scores = simdist.fit_score(
+                    A_block, B_block, iters, lr, score_method, 
+                    zero_pad=zero_pad, batch=A_block.shape[0], n_job=n_job
+                ) # (block_size, )
+
+                if isinstance(block_scores, torch.Tensor):
+                    block_scores = block_scores.cpu().numpy()
+                scores.append(block_scores)
+
+                # cleanup
+                del A_block, B_block, block_scores
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            scores = np.concatenate(scores, axis=0)
+
+            success = True  # ✅ success at this n_blocks
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(f"OOM at n_blocks={n_blocks}, retrying with more blocks...")
+                torch.cuda.empty_cache()
+                gc.collect()
+                n_blocks *= 2  # double blocks
+                tried += 1
+            else:
+                raise e
+
+    if not success:
+        raise RuntimeError(f"Failed to fit even with {n_blocks} blocks")
 
     # Compute scores in a batch
-    scores = simdist.fit_score(A_padded, B_padded, iters, lr, score_method, zero_pad=zero_pad,batch=A_padded.shape[0], n_job=n_job)
+    # scores = simdist.fit_score(A_padded, B_padded, iters, lr, score_method, zero_pad=zero_pad,batch=A_padded.shape[0], n_job=n_job)
 
     # Place scores in the similarity matrix
+
     for idx, (i, j) in enumerate(indices):
         sims[i, j] = scores[idx]
         if symmetric:
